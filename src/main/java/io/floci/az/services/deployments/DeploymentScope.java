@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -50,8 +51,9 @@ final class DeploymentScope implements TemplateScope {
     /**
      * @param template      the parsed template
      * @param supplied      the parameter values the request supplied, keyed by lowercase name
-     * @param resourceGroup what {@code resourceGroup()} returns; null at subscription scope, where it is an error
-     * @param subscription  what {@code subscription()} returns
+     * @param resourceGroup what {@code resourceGroup()} returns; null at subscription and tenant scope, where it is an
+     *                      error
+     * @param subscription  what {@code subscription()} returns; null at tenant scope, where it is an error
      * @param tenant        what {@code tenant()} returns
      * @param environment   what {@code environment()} returns
      * @param deployment    builds what {@code deployment()} returns; it reads the resolved parameters
@@ -140,7 +142,16 @@ final class DeploymentScope implements TemplateScope {
 
     @Override
     public JsonNode subscription() {
+        if (subscription == null) {
+            throw DeploymentTemplate.invalid("The template function 'subscription' is not expected at this "
+                + "location: a tenant-scope deployment has no subscription.");
+        }
         return subscription.deepCopy();
+    }
+
+    @Override
+    public Level level() {
+        return resourceGroup != null ? Level.RESOURCE_GROUP : subscription != null ? Level.SUBSCRIPTION : Level.TENANT;
     }
 
     @Override
@@ -166,6 +177,11 @@ final class DeploymentScope implements TemplateScope {
     @Override
     public JsonNode list(String resourceId, String action, String apiVersion, JsonNode body) {
         return live.list(resourceId, action, apiVersion, body);
+    }
+
+    @Override
+    public JsonNode userFunction(String name, List<JsonNode> arguments) {
+        return template.functions().call(name, arguments, this);
     }
 
     /** Every declared parameter's value, in declaration order: supplied, else its default. */

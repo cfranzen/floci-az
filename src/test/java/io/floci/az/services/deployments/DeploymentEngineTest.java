@@ -367,6 +367,53 @@ class DeploymentEngineTest {
         assertFalse(sent.get(0).body().has("resources"), "nested children are not sent with the parent");
     }
 
+    private static final String NESTED_TEMPLATE = """
+        {"mode": "Incremental", "parameters": {"prefix": {"value": "[literal"}}, "template": {
+          "parameters": {"prefix": {"type": "string"}},
+          "variables": {"suffix": "[concat(parameters('prefix'), '-v')]"},
+          "resources": [
+            {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "inner",
+             "resourceGroup": "rg2",
+             "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "inner"},
+               "parameters": {"name": {"value": "[variables('suffix')]"}},
+               "template": {"parameters": {"name": {"type": "string"}},
+                            "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                                           "name": "[parameters('name')]"}]}}},
+            {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "outer",
+             "properties": {"mode": "Incremental",
+               "template": {"resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                                           "name": "[variables('suffix')]"}]}}}]}}
+        """;
+
+    @Test
+    void anInnerNestedDeploymentIsSentAsWrittenToItsTargetResourceGroup() throws Exception {
+        DeploymentEngine.Result result = engine.deploy(request(NESTED_TEMPLATE));
+
+        assertEquals("Succeeded", result.provisioningState(), String.valueOf(result.error()));
+        Sent inner = sent.get(0);
+        assertEquals("/subscriptions/" + SUB + "/resourceGroups/rg2/providers/Microsoft.Resources/deployments/inner",
+            inner.path());
+        assertEquals("2022-09-01", inner.apiVersion());
+        assertFalse(inner.body().has("resourceGroup"), "the target is in the id, not the body");
+        assertEquals("[parameters('name')]",
+            inner.body().path("properties").path("template").path("resources").get(0).path("name").asText(),
+            "an inner template is not evaluated by the parent");
+        assertEquals("[literal-v", inner.body().path("properties").path("parameters").path("name").path("value").asText());
+    }
+
+    @Test
+    void anOuterNestedDeploymentCarriesTheParentsValuesEscaped() throws Exception {
+        engine.deploy(request(NESTED_TEMPLATE));
+
+        Sent outer = sent.stream().filter(request -> request.path().endsWith("/deployments/outer")).findFirst()
+            .orElseThrow();
+        assertEquals(RG_ID + "/providers/Microsoft.Resources/deployments/outer", outer.path());
+        JsonNode template = outer.body().path("properties").path("template");
+        assertEquals("[[literal", template.path("parameters").path("prefix").path("defaultValue").asText());
+        assertEquals("[[literal-v", template.path("variables").path("suffix").asText());
+        assertEquals("[variables('suffix')]", template.path("resources").get(0).path("name").asText());
+    }
+
     @Test
     void validateChecksEverythingAndSendsNothing() throws Exception {
         List<String> ids = engine.validate(request(STORAGE_TEMPLATE));
@@ -482,5 +529,80 @@ class DeploymentEngineTest {
         assertEquals("POST", post.method());
         assertEquals(SA_ID + "/listKeys", post.path());
         assertEquals("2023-01-01", post.apiVersion());
+    }
+
+    private static String linkedParent(String relativePath) {
+        return """
+            {"mode": "Incremental", "templateLink": {"uri": "https://store.example/t/main.json?sv=1&sig=SECRET"},
+             "template": {"resources": [{"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01",
+               "name": "child", "properties": {"mode": "Incremental", "templateLink": {"relativePath": "%s"}}}]}}
+            """.formatted(relativePath);
+    }
+
+    @Test
+    void aRelativePathKeepsTheParentsQueryOnTheParentsHost() throws Exception {
+        DeploymentEngine.Result result = engine.deploy(request(linkedParent("children/child.json")));
+
+        assertEquals("Succeeded", result.provisioningState(), String.valueOf(result.error()));
+        assertEquals("https://store.example/t/children/child.json?sv=1&sig=SECRET",
+            sent.getFirst().body().path("properties").path("templateLink").path("uri").asText());
+    }
+
+    @Test
+    void aRelativePathThatLeavesTheParentsHostIsRefusedAndSendsNoToken() throws Exception {
+        for (String escape : new String[] {"//attacker.example/child.json", "https://attacker.example/child.json",
+                "http://store.example/t/child.json"}) {
+            sent.clear();
+            DeploymentEngine.Result result = engine.deploy(request(linkedParent(escape)));
+
+            assertEquals("Failed", result.provisioningState(), escape);
+            assertEquals("InvalidTemplate", result.error().path("details").get(0).path("code").asText(), escape);
+            assertTrue(sent.isEmpty(), escape + " sent " + sent);
+        }
+    }
+
+    @Test
+    void anInnerNestedTemplatesReferencesAreTheChildsAndOnlyItsParametersAreTheParents() throws Exception {
+        DeploymentEngine.Result result = engine.deploy(request("""
+            {"mode": "Incremental", "template": {"resources": [
+              {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "module",
+               "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "inner"},
+                 "parameters": {"blob": {"value": "[reference('sa1').primaryEndpoints.blob]"}},
+                 "template": {
+                   "parameters": {"childName": {"type": "string", "defaultValue": "childAccount"},
+                                  "blob": {"type": "string"}},
+                   "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                                  "name": "[parameters('childName')]", "location": "eastus"}],
+                   "outputs": {"child": {"type": "object", "value": "[reference(parameters('childName'))]"},
+                               "own": {"type": "object", "value": "[reference('childAccount')]"}}}}},
+              {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01", "name": "sa1",
+               "location": "eastus"}]}}
+            """));
+
+        assertEquals("Succeeded", result.provisioningState(), String.valueOf(result.error()));
+        List<String> puts = sent.stream().filter(request -> request.method().equals("PUT")).map(Sent::path).toList();
+        assertEquals(List.of(SA_ID, RG_ID + "/providers/Microsoft.Resources/deployments/module"), puts,
+            "a reference in the nested deployment's own parameters is still the parent's dependency");
+    }
+
+    @Test
+    void anOuterNestedTemplatesReferencesToTheParentOrderTheParentsResourcesFirst() throws Exception {
+        DeploymentEngine.Result result = engine.deploy(request("""
+            {"mode": "Incremental", "template": {"resources": [
+              {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "module",
+               "properties": {"mode": "Incremental", "template": {
+                 "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                                "name": "[concat('loop', copyIndex())]", "location": "eastus",
+                                "copy": {"name": "accounts", "count": 2},
+                                "tags": {"of": "[reference(concat('loop', copyIndex())).provisioningState]"}}],
+                 "outputs": {"blob": {"type": "string", "value": "[reference('sa1').primaryEndpoints.blob]"}}}}},
+              {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01", "name": "sa1",
+               "location": "eastus"}]}}
+            """));
+
+        assertEquals("Succeeded", result.provisioningState(), String.valueOf(result.error()));
+        List<String> puts = sent.stream().filter(request -> request.method().equals("PUT")).map(Sent::path).toList();
+        assertEquals(List.of(SA_ID, RG_ID + "/providers/Microsoft.Resources/deployments/module"), puts,
+            "an outer template is evaluated in the parent, so its reference to sa1 orders sa1 first");
     }
 }

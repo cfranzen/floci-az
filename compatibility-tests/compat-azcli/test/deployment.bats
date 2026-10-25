@@ -47,6 +47,7 @@ setup() {
 teardown_file() {
     az group delete -n "$DEPLOY_RG" --yes -o none 2>/dev/null || true
     az group delete -n floci-test-sub-deploy-rg --yes -o none 2>/dev/null || true
+    az group delete -n floci-test-tenant-deploy-rg --yes -o none 2>/dev/null || true
     rm -f "$TEMPLATE_FILE"
 }
 
@@ -55,6 +56,18 @@ teardown_file() {
         --parameters accountName="$DEPLOY_SA"
     assert_success
     assert_equal "$(echo "$output" | jq -r '.properties.provisioningState')" "Succeeded"
+    run az storage account show -n "$DEPLOY_SA" -g "$DEPLOY_RG" -o none
+    assert_failure
+}
+
+@test "az deployment group what-if: predicts a Create without creating anything" {
+    run az_json deployment group what-if -g "$DEPLOY_RG" --template-file "$TEMPLATE_FILE" \
+        --parameters accountName="$DEPLOY_SA" --no-pretty-print
+    assert_success
+    assert_equal "$(echo "$output" | jq -r '.status')" "Succeeded"
+    assert_equal "$(echo "$output" | jq -r '.changes[0].changeType')" "Create"
+    assert_equal "$(echo "$output" | jq -r '.changes[0].resourceId | ascii_downcase')" \
+        "/subscriptions/${SUB_ID}/resourcegroups/${DEPLOY_RG}/providers/microsoft.storage/storageaccounts/${DEPLOY_SA}"
     run az storage account show -n "$DEPLOY_SA" -g "$DEPLOY_RG" -o none
     assert_failure
 }
@@ -106,7 +119,7 @@ teardown_file() {
     assert_success
 }
 
-@test "az deployment sub create: a subscription-scope template creates a resource group" {
+@test "az deployment sub create: a subscription-scope template creates a resource group and deploys into it" {
     local sub_template
     sub_template="$(mktemp --suffix .json)"
     cat > "$sub_template" <<'JSON'
@@ -116,10 +129,22 @@ teardown_file() {
   "parameters": {"rgName": {"type": "string"}},
   "resources": [
     {"type": "Microsoft.Resources/resourceGroups", "apiVersion": "2021-04-01",
-     "name": "[parameters('rgName')]", "location": "westeurope", "tags": {"made": "sub"}}
+     "name": "[parameters('rgName')]", "location": "westeurope", "tags": {"made": "sub"}},
+    {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "storage-module",
+     "resourceGroup": "[parameters('rgName')]",
+     "dependsOn": ["[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('rgName'))]"],
+     "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "inner"},
+       "template": {
+         "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+         "contentVersion": "1.0.0.0",
+         "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                        "name": "flocitestazmodulesa", "location": "westeurope",
+                        "kind": "StorageV2", "sku": {"name": "Standard_LRS"}}],
+         "outputs": {"accountName": {"type": "string", "value": "flocitestazmodulesa"}}}}}
   ],
   "outputs": {
-    "rgId": {"type": "string", "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('rgName'))]"}
+    "rgId": {"type": "string", "value": "[subscriptionResourceId('Microsoft.Resources/resourceGroups', parameters('rgName'))]"},
+    "accountFromModule": {"type": "string", "value": "[reference('storage-module').outputs.accountName.value]"}
   }
 }
 JSON
@@ -129,8 +154,79 @@ JSON
     assert_success
     assert_equal "$(echo "$output" | jq -r '.properties.provisioningState')" "Succeeded"
 
+    assert_equal "$(echo "$output" | jq -r '.properties.outputs.accountFromModule.value')" "flocitestazmodulesa"
+
     run az_json group show -n floci-test-sub-deploy-rg
     assert_success
     assert_equal "$(echo "$output" | jq -r '.location')" "westeurope"
     assert_equal "$(echo "$output" | jq -r '.tags.made')" "sub"
+
+    run az_json storage account show -n flocitestazmodulesa -g floci-test-sub-deploy-rg
+    assert_success
+}
+
+@test "az deployment group create --template-uri: deploys a template staged in blob storage" {
+    local conn
+    conn="$(storage_conn devstoreaccount1)"
+    run az storage container create -n floci-test-templates --connection-string "$conn" -o none
+    assert_success
+    run az storage blob upload -c floci-test-templates -f "$TEMPLATE_FILE" -n storage.json \
+        --connection-string "$conn" --overwrite -o none
+    assert_success
+
+    local uri="${FLOCI_AZ_ENDPOINT}/devstoreaccount1/floci-test-templates/storage.json"
+    run az_json deployment group create -g "$DEPLOY_RG" -n floci-test-linked --template-uri "$uri" \
+        --parameters accountName=flocitestazlinkedsa
+    assert_success
+    assert_equal "$(echo "$output" | jq -r '.properties.provisioningState')" "Succeeded"
+    assert_equal "$(echo "$output" | jq -r '.properties.templateLink.uri')" "$uri"
+
+    run az_json storage account show -n flocitestazlinkedsa -g "$DEPLOY_RG"
+    assert_success
+}
+
+@test "az deployment tenant create: a tenant template creates a resource group through a nested deployment" {
+    local tenant_template
+    tenant_template="$(mktemp --suffix .json)"
+    cat > "$tenant_template" <<JSON
+{
+  "\$schema": "https://schema.management.azure.com/schemas/2019-08-01/tenantDeploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "resources": [
+    {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "into-subscription",
+      "location": "westeurope",
+      "subscriptionId": "${SUB_ID}",
+      "properties": {
+        "mode": "Incremental",
+        "expressionEvaluationOptions": {"scope": "inner"},
+        "template": {
+          "\$schema": "https://schema.management.azure.com/schemas/2018-05-01/subscriptionDeploymentTemplate.json#",
+          "contentVersion": "1.0.0.0",
+          "resources": [
+            {"type": "Microsoft.Resources/resourceGroups", "apiVersion": "2021-04-01",
+             "name": "floci-test-tenant-deploy-rg", "location": "westeurope"}
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {"tenantId": {"type": "string", "value": "[tenant().tenantId]"}}
+}
+JSON
+    run az_json deployment tenant create -n floci-test-tenant-deployment -l "$LOCATION" --template-file "$tenant_template"
+    rm -f "$tenant_template"
+    assert_success
+    assert_equal "$(echo "$output" | jq -r '.properties.provisioningState')" "Succeeded"
+    assert_equal "$(echo "$output" | jq -r '.properties.outputs.tenantId.value')" "$TENANT_ID"
+
+    run az_json group show -n floci-test-tenant-deploy-rg
+    assert_success
+    assert_equal "$(echo "$output" | jq -r '.location')" "westeurope"
+
+    run az_json deployment tenant show -n floci-test-tenant-deployment
+    assert_success
+    assert_equal "$(echo "$output" | jq -r '.id')" "/providers/Microsoft.Resources/deployments/floci-test-tenant-deployment"
 }

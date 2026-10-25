@@ -71,7 +71,10 @@ final class TemplateFunctions {
 
     static JsonNode call(String name, List<JsonNode> args, TemplateScope scope) {
         String key = lower(name);
-        if (UNSUPPORTED.contains(key) || key.contains(".")) {
+        if (key.contains(".")) {
+            return scope.userFunction(name, args);
+        }
+        if (UNSUPPORTED.contains(key)) {
             throw TemplateException.invalid("The template function '" + name + "' is not supported by floci-az.");
         }
         if (key.startsWith("list")) {
@@ -259,14 +262,22 @@ final class TemplateFunctions {
     /**
      * {@code resourceId([subscriptionId], [resourceGroupName], resourceType, name...)}: the type is the first
      * argument that contains a slash; one argument before it is the group, two are the subscription and the group.
+     * With neither, the id takes the deployment's level ({@code template-functions-resource.md}, resourceId): in its
+     * resource group, under its subscription at subscription scope, or {@code /providers/...} at tenant scope.
      */
     private static String resourceId(String name, List<JsonNode> args, TemplateScope scope) {
         List<String> values = strings(name, args, 2);
         int typeIndex = typeIndex(name, values, 2);
+        String provider = providerPath(name, values.get(typeIndex), values.subList(typeIndex + 1, values.size()));
+        if (typeIndex == 0 && scope.level() == TemplateScope.Level.TENANT) {
+            return provider;
+        }
         String subscription = typeIndex == 2 ? values.get(0) : subscriptionId(scope);
+        if (typeIndex == 0 && scope.level() == TemplateScope.Level.SUBSCRIPTION) {
+            return "/subscriptions/" + subscription + provider;
+        }
         String group = typeIndex == 0 ? text(scope.resourceGroup().path("name")) : values.get(typeIndex - 1);
-        return "/subscriptions/" + subscription + "/resourceGroups/" + group
-            + providerPath(name, values.get(typeIndex), values.subList(typeIndex + 1, values.size()));
+        return "/subscriptions/" + subscription + "/resourceGroups/" + group + provider;
     }
 
     /** {@code subscriptionResourceId([subscriptionId], resourceType, name...)}. */

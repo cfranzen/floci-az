@@ -93,10 +93,18 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
 
     /** The deployments marker, matched in any case: ARM resolves namespaces and types case-insensitively. */
     private static final String MARKER = ArmPaths.providerMarker(NAMESPACE) + "deployments";
+    private static final String TEMPLATE_HASH_MARKER = ArmPaths.providerMarker(NAMESPACE) + "calculateTemplateHash";
 
-    /** {@code subscriptions/{sub}/resourcegroups/{rg}/providers/Microsoft.Resources/deployments[/{name}[/{action}]]}. */
+    /** {@code providers/Microsoft.Resources/calculateTemplateHash}, at tenant level. */
+    private static final Pattern TEMPLATE_HASH = Pattern.compile(
+        "providers/microsoft\\.resources/calculatetemplatehash/?", Pattern.CASE_INSENSITIVE);
+
+    /**
+     * {@code [subscriptions/{sub}[/resourcegroups/{rg}]/]providers/Microsoft.Resources/deployments[/{name}[/{action}]]}:
+     * resource-group, subscription or tenant scope.
+     */
     private static final Pattern PATH = Pattern.compile(
-        "subscriptions/([^/]+)(?:/resourcegroups/([^/]+))?/providers/microsoft\\.resources/deployments"
+        "(?:subscriptions/([^/]+)(?:/resourcegroups/([^/]+))?/)?providers/microsoft\\.resources/deployments"
             + "(?:/([^/?]+)(?:/([^/?]+))?)?/?",
         Pattern.CASE_INSENSITIVE);
 
@@ -105,8 +113,8 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
      * segment: the spec's {@code DeploymentOperations_List} path has none, and the az CLI sends that form.
      */
     private static final Pattern OPERATIONS = Pattern.compile(
-        "subscriptions/([^/]+)(?:/resourcegroups/([^/]+))?/(?:providers/microsoft\\.resources/)?deployments/([^/?]+)"
-            + "/operations(?:/([^/?]+))?/?", Pattern.CASE_INSENSITIVE);
+        "(?:subscriptions/([^/]+)(?:/resourcegroups/([^/]+))?/)?(?:providers/microsoft\\.resources/)?deployments/"
+            + "([^/?]+)/operations(?:/([^/?]+))?/?", Pattern.CASE_INSENSITIVE);
 
     /** {@code subscriptions/{sub}/resourcegroups/{rg}/deployments/...}: the form with no provider segment. */
     private static final Pattern NO_PROVIDER_SEGMENT = Pattern.compile(
@@ -114,7 +122,7 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
 
     /** {@code .../deployments/{name}/operationStatuses/{id}}. */
     private static final Pattern OPERATION_STATUS = Pattern.compile(
-        "subscriptions/[^/]+(?:/resourcegroups/[^/]+)?/providers/microsoft\\.resources/deployments/[^/?]+"
+        "(?:subscriptions/[^/]+(?:/resourcegroups/[^/]+)?/)?providers/microsoft\\.resources/deployments/[^/?]+"
             + "/operationstatuses/([^/?]+)/?", Pattern.CASE_INSENSITIVE);
 
     private static final Pattern STATE_FILTER =
@@ -128,6 +136,7 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
     private final EmulatorConfig config;
     private final DeploymentEngine engine;
     private final ResourceGroups groups;
+    private final LinkedTemplates links;
 
     /** Runs each deployment after its {@code PUT} has been answered; virtual threads, as runs mostly wait. */
     private final ExecutorService runner = Executors.newVirtualThreadPerTaskExecutor();
@@ -160,10 +169,12 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
     }
 
     @Inject
-    public DeploymentsHandler(EmulatorConfig config, DeploymentEngine engine, ResourceGroups groups) {
+    public DeploymentsHandler(EmulatorConfig config, DeploymentEngine engine, ResourceGroups groups,
+                              LinkedTemplates links) {
         this.config = config;
         this.engine = engine;
         this.groups = groups;
+        this.links = links;
     }
 
     @Override
@@ -192,9 +203,13 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         return NO_PROVIDER_SEGMENT.matcher(query < 0 ? path : path.substring(0, query)).matches();
     }
 
-    /** A path under {@code /providers/Microsoft.Resources/deployments}, at any scope. */
+    /**
+     * A path under {@code /providers/Microsoft.Resources/deployments}, at any scope, or the tenant-level
+     * {@code /providers/Microsoft.Resources/calculateTemplateHash}.
+     */
     static boolean isDeploymentPath(String path) {
-        return ArmPaths.indexOfIgnoreCase(path, MARKER) >= 0;
+        return ArmPaths.indexOfIgnoreCase(path, MARKER) >= 0
+            || ArmPaths.indexOfIgnoreCase(path, TEMPLATE_HASH_MARKER) >= 0;
     }
 
     @Override
@@ -202,6 +217,10 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         String path = req.resourcePath();
         int query = path.indexOf('?');
         String bare = query < 0 ? path : path.substring(0, query);
+        if (TEMPLATE_HASH.matcher(bare).matches()) {
+            return "POST".equals(req.method().toUpperCase(Locale.ROOT)) ? calculateTemplateHash(req)
+                : Response.status(405).build();
+        }
         Matcher operationsPath = OPERATIONS.matcher(bare);
         if (operationsPath.matches()) {
             if (!"GET".equals(req.method().toUpperCase(Locale.ROOT))) {
@@ -219,8 +238,8 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         }
         Matcher matcher = PATH.matcher(query < 0 ? path : path.substring(0, query));
         if (!matcher.matches()) {
-            return ArmErrors.notFound("floci-az serves deployments at resource-group and subscription scope only: "
-                + path);
+            return ArmErrors.notFound("floci-az serves deployments at resource-group, subscription and tenant scope "
+                + "only: " + path);
         }
         String subscriptionId = matcher.group(1);
         String resourceGroup = matcher.group(2);
@@ -239,25 +258,30 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         }
         return switch (method) {
             case "PUT" -> createOrUpdate(req, subscriptionId, resourceGroup, name);
-            case "GET" -> get(subscriptionId, resourceGroup, name);
-            case "HEAD" -> Response.status(deployments.containsKey(key(subscriptionId, resourceGroup, name))
+            case "GET" -> get(req, subscriptionId, resourceGroup, name);
+            case "HEAD" -> Response.status(deployments.containsKey(key(req, subscriptionId, resourceGroup, name))
                 ? 204 : 404).build();
-            case "DELETE" -> delete(subscriptionId, resourceGroup, name);
+            case "DELETE" -> delete(req, subscriptionId, resourceGroup, name);
             default -> Response.status(405).build();
         };
     }
 
     private Response createOrUpdate(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
-        JsonNode body = body(req);
+        JsonNode body;
+        try {
+            body = deploymentRequest(req);
+        } catch (TemplateException e) {
+            return templateError(e);
+        }
         if (body == null) {
             return invalidContent();
         }
-        String key = key(subscriptionId, resourceGroup, name);
+        String key = key(req, subscriptionId, resourceGroup, name);
         StoredDeployment current = deployments.get(key);
         if (current != null && current.active()) {
             return deploymentActive(name, current);
         }
-        Response location = checkLocation(resourceGroup, name, body, current);
+        Response location = checkLocation(subscriptionId, resourceGroup, name, body, current);
         if (location != null) {
             return location;
         }
@@ -350,10 +374,25 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
             stored.operations());
     }
 
+    /**
+     * {@code Deployments_CalculateTemplateHash}: the body is the template itself, and the answer its minified form and
+     * its hash, the same {@link TemplateHash} a deployment of that template reports as {@code templateHash}.
+     */
+    private Response calculateTemplateHash(AzureRequest req) {
+        JsonNode template = body(req);
+        if (template == null) {
+            return invalidContent();
+        }
+        ObjectNode answer = JsonNodeFactory.instance.objectNode();
+        answer.put("minifiedTemplate", TemplateHash.minified(template));
+        answer.put("templateHash", TemplateHash.of(template));
+        return json(200, answer);
+    }
+
     /** {@code DeploymentOperations_List} and {@code DeploymentOperations_Get}. */
     private Response operations(AzureRequest req, String path, String subscriptionId, String resourceGroup,
                                 String name, String operationId) {
-        StoredDeployment stored = deployments.get(key(subscriptionId, resourceGroup, name));
+        StoredDeployment stored = deployments.get(key(req, subscriptionId, resourceGroup, name));
         if (stored == null) {
             return deploymentNotFound(name);
         }
@@ -448,22 +487,49 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         return bodies;
     }
 
-    private Response get(String subscriptionId, String resourceGroup, String name) {
-        StoredDeployment stored = deployments.get(key(subscriptionId, resourceGroup, name));
+    private Response get(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
+        StoredDeployment stored = deployments.get(key(req, subscriptionId, resourceGroup, name));
         return stored == null ? deploymentNotFound(name) : json(200, stored.body());
     }
 
-    private Response delete(String subscriptionId, String resourceGroup, String name) {
-        StoredDeployment existing = deployments.get(key(subscriptionId, resourceGroup, name));
+    private Response delete(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
+        StoredDeployment existing = deployments.get(key(req, subscriptionId, resourceGroup, name));
         if (existing != null && existing.active()) {
             return deploymentActive(name, existing);
         }
-        deployments.remove(key(subscriptionId, resourceGroup, name));
+        deployments.remove(key(req, subscriptionId, resourceGroup, name));
         return Response.status(204).build();
     }
 
-    private Response cancel(String subscriptionId, String resourceGroup, String name) {
-        StoredDeployment existing = deployments.get(key(subscriptionId, resourceGroup, name));
+    /**
+     * {@code Deployments_WhatIf}: the changes the deployment would make, answered {@code 200} at once, one of the two
+     * answers the spec declares; Azure answers {@code 202} and lets the client poll a {@code Location}. A template it
+     * cannot run is {@code 400} with the template error.
+     */
+    private Response whatIf(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
+        JsonNode body;
+        try {
+            body = deploymentRequest(req);
+        } catch (TemplateException e) {
+            return templateError(e);
+        }
+        if (body == null) {
+            return invalidContent();
+        }
+        Response location = checkLocation(subscriptionId, resourceGroup, name, body, null);
+        if (location != null) {
+            return location;
+        }
+        try {
+            return json(200, engine.whatIf(new DeploymentEngine.Request(subscriptionId, resourceGroup, name,
+                body.get("properties"), req.detached())));
+        } catch (TemplateException e) {
+            return templateError(e);
+        }
+    }
+
+    private Response cancel(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
+        StoredDeployment existing = deployments.get(key(req, subscriptionId, resourceGroup, name));
         if (existing == null) {
             return deploymentNotFound(name);
         }
@@ -477,7 +543,7 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
     }
 
     private Response list(AzureRequest req, String subscriptionId, String resourceGroup) {
-        String prefix = key(subscriptionId, resourceGroup, "");
+        String prefix = key(req, subscriptionId, resourceGroup, "");
         String state = null;
         String filter = req.queryParams() == null ? null : req.queryParams().get("$filter");
         if (filter != null) {
@@ -503,9 +569,10 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
                             String action) {
         return switch (action.toLowerCase(Locale.ROOT)) {
             case "validate" -> validate(req, subscriptionId, resourceGroup, name);
-            case "cancel" -> cancel(subscriptionId, resourceGroup, name);
+            case "cancel" -> cancel(req, subscriptionId, resourceGroup, name);
+            case "whatif" -> whatIf(req, subscriptionId, resourceGroup, name);
             case "exporttemplate" -> {
-                StoredDeployment stored = deployments.get(key(subscriptionId, resourceGroup, name));
+                StoredDeployment stored = deployments.get(key(req, subscriptionId, resourceGroup, name));
                 if (stored == null) {
                     yield deploymentNotFound(name);
                 }
@@ -519,11 +586,16 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
     }
 
     private Response validate(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
-        JsonNode body = body(req);
+        JsonNode body;
+        try {
+            body = deploymentRequest(req);
+        } catch (TemplateException e) {
+            return templateError(e);
+        }
         if (body == null) {
             return invalidContent();
         }
-        Response location = checkLocation(resourceGroup, name, body, null);
+        Response location = checkLocation(subscriptionId, resourceGroup, name, body, null);
         if (location != null) {
             return location;
         }
@@ -557,6 +629,7 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         properties.put("templateHash", result.templateHash());
         properties.set("parameters", result.parameters());
         properties.put("mode", body.path("properties").path("mode").asText());
+        echoLinks(body, properties);
         properties.put("provisioningState", result.provisioningState());
         properties.put("timestamp", result.finished().toString());
         properties.put("duration", Duration.between(result.started(), result.finished()).toString());
@@ -573,18 +646,20 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
     }
 
     /**
-     * A subscription-scope deployment's {@code location}, where its data is stored ({@code deploy-to-subscription.md},
+     * A subscription- or tenant-scope deployment's {@code location}, where its data is stored
+     * ({@code deploy-to-subscription.md} and {@code deploy-to-tenant.md},
      * "Deployment location and name"): required, and fixed for a name once used. Null when it is acceptable; a
      * resource-group deployment takes its group's location and needs none.
      */
-    private static Response checkLocation(String resourceGroup, String name, JsonNode body, StoredDeployment existing) {
+    private static Response checkLocation(String subscriptionId, String resourceGroup, String name, JsonNode body,
+                                          StoredDeployment existing) {
         if (resourceGroup != null) {
             return null;
         }
         String location = body.path("location").asText("");
         if (location.isBlank()) {
             return ArmErrors.error(400, "LocationRequired", "The location property is required for the "
-                + "subscription-scope deployment '" + name + "'.");
+                + (subscriptionId == null ? "tenant" : "subscription") + "-scope deployment '" + name + "'.");
         }
         String previous = existing == null ? null : existing.body().path("location").asText(null);
         if (previous != null && !squash(previous).equals(squash(location))) {
@@ -605,6 +680,7 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         ObjectNode properties = answer.putObject("properties");
         properties.put("templateHash", prepared.templateHash());
         properties.put("mode", body.path("properties").path("mode").asText());
+        echoLinks(body, properties);
         properties.put("provisioningState", "Accepted");
         properties.put("timestamp", Instant.now().toString());
         properties.put("duration", "PT0S");
@@ -612,6 +688,15 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         properties.putArray("providers");
         properties.putArray("dependencies");
         return answer;
+    }
+
+    /** The {@code templateLink} and {@code parametersLink} a deployment was sent with, echoed as Azure does. */
+    private static void echoLinks(JsonNode body, ObjectNode properties) {
+        for (String link : new String[] {"templateLink", "parametersLink"}) {
+            if (body.path("properties").path(link).isObject()) {
+                properties.set(link, body.path("properties").get(link));
+            }
+        }
     }
 
     /** An {@code operationStatuses} answer: {@code {"status": ...}}, with the error when the run failed. */
@@ -646,13 +731,27 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         answer.put("id", request.id());
         answer.put("name", request.name());
         answer.put("type", DeploymentEngine.DEPLOYMENTS_TYPE);
-        if (request.atSubscription() && body.path("location").isTextual()) {
+        if (!request.inResourceGroup() && body.path("location").isTextual()) {
             answer.put("location", body.get("location").asText());
         }
         if (body.path("tags").isObject()) {
             answer.set("tags", body.get("tags"));
         }
         return answer;
+    }
+
+    /**
+     * A deployment request body with a linked template and parameter file inlined ({@link LinkedTemplates}); null when
+     * the body is not a JSON object. A link it cannot use throws {@link TemplateException}.
+     */
+    private JsonNode deploymentRequest(AzureRequest req) {
+        JsonNode body = body(req);
+        if (body == null || !body.has("properties")) {
+            return body;
+        }
+        ObjectNode inlined = body.deepCopy();
+        inlined.set("properties", links.inline(body.get("properties")));
+        return inlined;
     }
 
     /** The request body, parsed leniently; null when it is not a JSON object. */
@@ -666,10 +765,19 @@ public class DeploymentsHandler implements AzureServiceHandler, Resettable, Reso
         }
     }
 
-    /** A deployment's key; a subscription-scope deployment has an empty resource-group part. */
-    private static String key(String subscriptionId, String resourceGroup, String name) {
-        return (subscriptionId + "/" + (resourceGroup == null ? "" : resourceGroup) + "/" + name)
-            .toLowerCase(Locale.ROOT);
+    /**
+     * A deployment's key: {@code {subscription}/{group}/{name}}, a subscription-scope deployment having an empty group
+     * part. A tenant-scope deployment belongs to the caller's tenant, so its key is {@code tenant:{tenantId}//{name}}
+     * and two tenants never read or replace each other's.
+     */
+    private String key(AzureRequest req, String subscriptionId, String resourceGroup, String name) {
+        return key(subscriptionId == null ? "tenant:" + engine.callerTenant(req) : subscriptionId, resourceGroup,
+            name);
+    }
+
+    private static String key(String owner, String resourceGroup, String name) {
+        String group = resourceGroup == null ? "" : resourceGroup;
+        return (owner + "/" + group + "/" + name).toLowerCase(Locale.ROOT);
     }
 
     private static Response templateError(TemplateException e) {

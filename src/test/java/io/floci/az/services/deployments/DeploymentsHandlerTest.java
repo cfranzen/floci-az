@@ -1,6 +1,7 @@
 package io.floci.az.services.deployments;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.RestAssured;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeEach;
@@ -8,16 +9,22 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.net.URI;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.emptyOrNullString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.everyItem;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -374,6 +381,334 @@ class DeploymentsHandlerTest {
             .body("properties.error.details[0].message", containsString("subscription-scope deployment has no resource group"));
     }
 
+    /** azd's shape: a subscription template that creates a group, then deploys into it through a module. */
+    private static String moduleDeployment(String scope) {
+        return """
+            {"location": "westeurope", "properties": {"mode": "Incremental", "template": {
+              "parameters": {"accountName": {"type": "string", "defaultValue": "moduleacct01"}},
+              "variables": {"groupName": "rg-module"},
+              "resources": [
+                {"type": "Microsoft.Resources/resourceGroups", "apiVersion": "2021-04-01",
+                 "name": "[variables('groupName')]", "location": "westeurope"},
+                {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "storage",
+                 "resourceGroup": "[variables('groupName')]",
+                 "dependsOn": ["[subscriptionResourceId('Microsoft.Resources/resourceGroups', variables('groupName'))]"],
+                 "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "SCOPE"},
+                   PARAMETERS
+                   "template": {
+                     PARAMETER_DECLARATIONS
+                     "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                                    "name": "[parameters('accountName')]", "location": "westeurope",
+                                    "kind": "StorageV2", "sku": {"name": "Standard_LRS"}}],
+                     "outputs": {"accountId": {"type": "string",
+                       "value": "[resourceId('Microsoft.Storage/storageAccounts', parameters('accountName'))]"}}}}}],
+              "outputs": {"fromModule": {"type": "string",
+                "value": "[reference('storage').outputs.accountId.value]"}}}}}
+            """.replace("SCOPE", scope)
+            .replace("PARAMETERS", scope.equals("inner")
+                ? "\"parameters\": {\"accountName\": {\"value\": \"[parameters('accountName')]\"}}," : "")
+            .replace("PARAMETER_DECLARATIONS", scope.equals("inner")
+                ? "\"parameters\": {\"accountName\": {\"type\": \"string\"}}," : "");
+    }
+
+    @Test
+    void aSubscriptionTemplateDeploysIntoItsNewGroupThroughAnInnerModule() throws Exception {
+        Response accepted = json(moduleDeployment("inner")).when().put(SUB_DEPLOYMENTS + "/main" + API);
+        assertEquals("Succeeded", awaitTerminal(accepted),
+            () -> given().when().get(SUB_DEPLOYMENTS + "/main" + API).asString());
+
+        String account = "/subscriptions/" + SUB + "/resourceGroups/rg-module/providers/Microsoft.Storage/"
+            + "storageAccounts/moduleacct01";
+        given().when().get(account + "?api-version=2023-01-01").then().statusCode(200);
+        given().when().get(SUB_DEPLOYMENTS + "/main" + API).then().statusCode(200)
+            .body("properties.outputs.fromModule.value", equalTo(account));
+        given().when().get("/subscriptions/" + SUB + "/resourceGroups/rg-module/providers/Microsoft.Resources/"
+            + "deployments/storage" + API).then().statusCode(200)
+            .body("properties.provisioningState", equalTo("Succeeded"))
+            .body("properties.outputs.accountId.value", equalTo(account));
+    }
+
+    @Test
+    void anOuterModuleUsesTheParentsParameters() throws Exception {
+        Response accepted = json(moduleDeployment("outer")).when().put(SUB_DEPLOYMENTS + "/main-outer" + API);
+        assertEquals("Succeeded", awaitTerminal(accepted),
+            () -> given().when().get(SUB_DEPLOYMENTS + "/main-outer" + API).asString());
+
+        given().when().get("/subscriptions/" + SUB + "/resourceGroups/rg-module/providers/Microsoft.Storage/"
+            + "storageAccounts/moduleacct01?api-version=2023-01-01").then().statusCode(200);
+    }
+
+    @Test
+    void calculateTemplateHashAgreesWithTheDeploymentsOwnHash() throws Exception {
+        String template = DEPLOYMENT.substring(DEPLOYMENT.indexOf("\"template\": ") + "\"template\": ".length(),
+            DEPLOYMENT.lastIndexOf("}}"));
+        Response hashed = json(template).when().post("/providers/Microsoft.Resources/calculateTemplateHash" + API);
+        hashed.then().statusCode(200)
+            .body("minifiedTemplate", startsWith("{\"$SCHEMA\":"));
+
+        assertEquals("Succeeded", awaitTerminal(put("hashed", DEPLOYMENT)));
+        given().when().get(DEPLOYMENTS + "/hashed" + API).then().statusCode(200)
+            .body("properties.templateHash", equalTo(hashed.path("templateHash")));
+    }
+
+    @Test
+    void whatIfPredictsCreatesWithoutCreatingAnything() {
+        given().contentType("application/json").body(DEPLOYMENT).when().post(DEPLOYMENTS + "/preview/whatIf" + API)
+            .then().statusCode(200)
+            .body("status", equalTo("Succeeded"))
+            .body("properties.changes", hasSize(4))
+            // The container is left out: the ARM container GET answers 200 for any container.
+            .body("properties.changes.findAll { !it.resourceId.contains('/containers/') }.changeType",
+                everyItem(equalTo("Create")))
+            .body("properties.changes[0].resourceId", equalTo(ACCOUNT))
+            .body("properties.changes[0].after.type", equalTo("Microsoft.Storage/storageAccounts"))
+            .body("properties.changes[0].after.location", equalTo("westeurope"));
+        given().when().get(ACCOUNT + "?api-version=2023-01-01").then().statusCode(404);
+        given().when().get(DEPLOYMENTS + "/preview" + API).then().statusCode(404);
+    }
+
+    @Test
+    void whatIfAfterADeploymentShowsWhatTheTemplateWouldChange() throws Exception {
+        assertEquals("Succeeded", awaitTerminal(put("base", DEPLOYMENT)));
+
+        given().contentType("application/json").body(DEPLOYMENT).when().post(DEPLOYMENTS + "/base/whatIf" + API)
+            .then().statusCode(200)
+            .body("properties.changes.find { it.resourceId.endsWith('/virtualNetworks/vnet1') }.changeType",
+                equalTo("NoChange"));
+        given().contentType("application/json").body(DEPLOYMENT.replace("10.0.0.0/16", "10.9.0.0/16"))
+            .when().post(DEPLOYMENTS + "/base/whatIf" + API).then().statusCode(200)
+            .body("properties.changes.find { it.resourceId.endsWith('/virtualNetworks/vnet1') }.changeType",
+                equalTo("Modify"))
+            .body("properties.changes.find { it.resourceId.endsWith('/virtualNetworks/vnet1') }.delta[0].path",
+                equalTo("properties.addressSpace.addressPrefixes"));
+        given().contentType("application/json")
+            .body(DEPLOYMENT.replace("\"mode\": \"Incremental\",",
+                "\"mode\": \"Incremental\", \"whatIfSettings\": {\"resultFormat\": \"ResourceIdOnly\"},"))
+            .when().post(DEPLOYMENTS + "/base/whatIf" + API).then().statusCode(200)
+            .body("properties.changes[0].before", nullValue())
+            .body("properties.changes[0].after", nullValue())
+            .body("properties.changes[0].resourceId", equalTo(ACCOUNT));
+    }
+
+    @Test
+    void whatIfMarksANestedDeploymentUnsupported() {
+        given().contentType("application/json").body(moduleDeployment("inner"))
+            .when().post(SUB_DEPLOYMENTS + "/main/whatIf" + API).then().statusCode(200)
+            .body("properties.changes[0].changeType", equalTo("Create"))
+            .body("properties.changes[1].changeType", equalTo("Unsupported"))
+            .body("properties.changes[1].unsupportedReason", containsString("nested deployment"));
+    }
+
+    /** Puts {@code content} in floci's own blob storage and answers its URL, the way a linked template is staged. */
+    private static String staged(String name, String content) {
+        given().put("/devstoreaccount1/templates?restype=container");
+        given().contentType("application/json").header("x-ms-blob-type", "BlockBlob").body(content)
+            .when().put("/devstoreaccount1/templates/" + name).then().statusCode(201);
+        return "http://localhost:" + RestAssured.port + "/devstoreaccount1/templates/" + name;
+    }
+
+    private static final String LINKED_TEMPLATE = """
+        {"contentVersion": "1.0.0.0",
+         "parameters": {"accountName": {"type": "string"}},
+         "resources": [
+           {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+            "name": "[parameters('accountName')]", "location": "westeurope", "kind": "StorageV2",
+            "sku": {"name": "Standard_LRS"}},
+           {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "child",
+            "properties": {"mode": "Incremental", "templateLink": {"relativePath": "children/child.json"}}}],
+         "outputs": {"name": {"type": "string", "value": "[parameters('accountName')]"}}}
+        """;
+
+    @Test
+    void aLinkedTemplateAndParameterFileAreDownloadedAndEchoed() throws Exception {
+        String template = staged("main.json", LINKED_TEMPLATE);
+        staged("children/child.json", """
+            {"contentVersion": "1.0.0.0", "resources": [
+              {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01", "name": "linkedchild01",
+               "location": "westeurope", "kind": "StorageV2", "sku": {"name": "Standard_LRS"}}]}
+            """);
+        String parameters = staged("main.parameters.json", """
+            {"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+             "contentVersion": "1.0.0.0", "parameters": {"accountName": {"value": "linkedmain01"}}}
+            """);
+
+        Response accepted = json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"uri\": \""
+            + template + "\", \"contentVersion\": \"1.0.0.0\"}, \"parametersLink\": {\"uri\": \"" + parameters + "\"}}}")
+            .when().put(DEPLOYMENTS + "/linked" + API);
+        accepted.then().statusCode(201).body("properties.templateLink.uri", equalTo(template));
+        assertEquals("Succeeded", awaitTerminal(accepted),
+            () -> given().when().get(DEPLOYMENTS + "/linked" + API).asString());
+
+        given().when().get(DEPLOYMENTS + "/linked" + API).then().statusCode(200)
+            .body("properties.outputs.name.value", equalTo("linkedmain01"))
+            .body("properties.parametersLink.uri", equalTo(parameters));
+        given().when().get(RG + "/providers/Microsoft.Storage/storageAccounts/linkedmain01?api-version=2023-01-01")
+            .then().statusCode(200);
+        given().when().get(RG + "/providers/Microsoft.Storage/storageAccounts/linkedchild01?api-version=2023-01-01")
+            .then().statusCode(200);
+        given().when().get(DEPLOYMENTS + "/child" + API).then().statusCode(200)
+            .body("properties.templateLink.uri", equalTo(template.replace("main.json", "children/child.json")));
+        given().when().post(DEPLOYMENTS + "/linked/exportTemplate" + API).then().statusCode(200)
+            .body("template.outputs.name.type", equalTo("string"));
+    }
+
+    @Test
+    void aLinkThatCannotBeUsedIsInvalidContentLink() {
+        String template = staged("versioned.json", "{\"contentVersion\": \"1.0.0.0\", \"resources\": []}");
+        String missing = "http://localhost:" + RestAssured.port + "/devstoreaccount1/templates/missing.json";
+        json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"uri\": \"" + missing + "\"}}}")
+            .when().put(DEPLOYMENTS + "/broken" + API).then().statusCode(400)
+            .body("error.code", equalTo("InvalidContentLink"))
+            .body("error.message", startsWith("Unable to download deployment content from '" + missing + "'"));
+        json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"uri\": \"" + template
+            + "\", \"contentVersion\": \"2.0.0.0\"}}}")
+            .when().post(DEPLOYMENTS + "/versioned/validate" + API).then().statusCode(400)
+            .body("error.code", equalTo("InvalidContentLink"));
+        json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"uri\": \"" + template
+            + "\"}, \"parameters\": {}, \"parametersLink\": {\"uri\": \"" + template + "\"}}}")
+            .when().put(DEPLOYMENTS + "/both" + API).then().statusCode(400)
+            .body("error.code", equalTo("InvalidTemplate"));
+        json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"id\": \"/subscriptions/x/"
+            + "resourceGroups/y/providers/Microsoft.Resources/templateSpecs/z/versions/1\"}}}")
+            .when().put(DEPLOYMENTS + "/spec" + API).then().statusCode(400)
+            .body("error.message", containsString("template spec"));
+        json("{\"properties\": {\"mode\": \"Incremental\", \"templateLink\": {\"uri\": \"http:/no-host.json\"}}}")
+            .when().put(DEPLOYMENTS + "/nohost" + API).then().statusCode(400)
+            .body("error.code", equalTo("InvalidContentLink"));
+    }
+
+    /** The documented contoso.uniqueName template, with an outer-scope nested deployment calling it too. */
+    private static final String USER_FUNCTION_DEPLOYMENT = """
+        {"properties": {"mode": "Incremental", "template": {
+          "contentVersion": "1.0.0.0",
+          "parameters": {"storageNamePrefix": {"type": "string", "maxLength": 11}},
+          "functions": [{"namespace": "contoso", "members": {"uniqueName": {
+            "parameters": [{"name": "namePrefix", "type": "string"}],
+            "output": {"type": "string",
+                       "value": "[format('{0}{1}', toLower(parameters('namePrefix')), uniqueString(resourceGroup().id))]"}
+          }}}],
+          "resources": [
+            {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+             "name": "[contoso.uniqueName(parameters('storageNamePrefix'))]", "location": "westeurope",
+             "kind": "StorageV2", "sku": {"name": "Standard_LRS"}},
+            {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "outer-module",
+             "properties": {"mode": "Incremental", "template": {
+               "resources": [{"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                 "name": "[contoso.uniqueName('Outer')]", "location": "westeurope", "kind": "StorageV2",
+                 "sku": {"name": "Standard_LRS"}}]}}}],
+          "outputs": {"accountName": {"type": "string",
+                                      "value": "[contoso.uniqueName(parameters('storageNamePrefix'))]"},
+                      "outerName": {"type": "string", "value": "[contoso.uniqueName('Outer')]"}}},
+          "parameters": {"storageNamePrefix": {"value": "Udf"}}}}
+        """;
+
+    @Test
+    void userDefinedFunctionsNameResourcesAndOutputsAndReachAnOuterNestedDeployment() throws Exception {
+        assertEquals("Succeeded", awaitTerminal(put("udf", USER_FUNCTION_DEPLOYMENT)));
+
+        String accountName = given().when().get(DEPLOYMENTS + "/udf" + API).then().statusCode(200)
+            .extract().path("properties.outputs.accountName.value");
+        String outerName = given().when().get(DEPLOYMENTS + "/udf" + API)
+            .then().extract().path("properties.outputs.outerName.value");
+        assertTrue(accountName.startsWith("udf") && accountName.length() == 16, accountName);
+        assertEquals(accountName.substring(3), outerName.substring(5), "the same uniqueString(resourceGroup().id)");
+        given().when().get(RG + "/providers/Microsoft.Storage/storageAccounts/" + accountName + "?api-version=2023-01-01")
+            .then().statusCode(200);
+        given().when().get(RG + "/providers/Microsoft.Storage/storageAccounts/" + outerName + "?api-version=2023-01-01")
+            .then().statusCode(200);
+    }
+
+    @Test
+    void aUserDefinedFunctionReadingVariablesIsRefusedAtValidation() {
+        json(USER_FUNCTION_DEPLOYMENT.replace("toLower(parameters('namePrefix'))", "variables('x')"))
+            .when().post(DEPLOYMENTS + "/udf-bad/validate" + API).then().statusCode(400)
+            .body("error.code", equalTo("InvalidTemplate"))
+            .body("error.message", containsString("can't access variables"));
+    }
+
+    private static final String TENANT_DEPLOYMENTS = "/providers/Microsoft.Resources/deployments";
+
+    /** A tenant template that creates a resource group in a subscription through a nested deployment. */
+    private static final String TENANT_DEPLOYMENT = """
+        {"location": "westeurope", "properties": {"mode": "Incremental",
+          "parameters": {"subscriptionId": {"value": "SUBSCRIPTION"}}, "template": {
+          "parameters": {"subscriptionId": {"type": "string"}},
+          "resources": [
+            {"type": "Microsoft.Resources/deployments", "apiVersion": "2025-04-01", "name": "into-sub",
+             "location": "westeurope", "subscriptionId": "[parameters('subscriptionId')]",
+             "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "inner"}, "template": {
+               "resources": [{"type": "Microsoft.Resources/resourceGroups", "apiVersion": "2021-04-01",
+                              "name": "rg-from-tenant", "location": "northeurope"}]}}}],
+          "outputs": {
+            "tenantId": {"type": "string", "value": "[tenant().tenantId]"},
+            "groupId": {"type": "string",
+                        "value": "[resourceId('Microsoft.Management/managementGroups', 'mg1')]"}}}}}
+        """;
+
+    private static String tenantDeployment() {
+        return TENANT_DEPLOYMENT.replace("SUBSCRIPTION", SUB);
+    }
+
+    @Test
+    void aTenantDeploymentRunsANestedDeploymentIntoASubscription() throws Exception {
+        Response accepted = json(tenantDeployment()).when().put(TENANT_DEPLOYMENTS + "/tenant1" + API);
+        accepted.then().statusCode(201)
+            .body("id", equalTo(TENANT_DEPLOYMENTS + "/tenant1"))
+            .body("location", equalTo("westeurope"));
+        assertEquals("Succeeded", awaitTerminal(accepted),
+            () -> given().when().get(TENANT_DEPLOYMENTS + "/tenant1" + API).asString());
+
+        given().when().get("/subscriptions/" + SUB + "/resourceGroups/rg-from-tenant?api-version=2021-04-01")
+            .then().statusCode(200).body("location", equalTo("northeurope"));
+        given().when().get(TENANT_DEPLOYMENTS + "/tenant1" + API).then().statusCode(200)
+            .body("properties.outputs.tenantId.value", not(emptyOrNullString()))
+            .body("properties.outputs.groupId.value", equalTo("/providers/Microsoft.Management/managementGroups/mg1"));
+        given().when().get(TENANT_DEPLOYMENTS + API).then().statusCode(200).body("value.name", contains("tenant1"));
+        given().when().get(TENANT_DEPLOYMENTS + "/tenant1/operations" + API).then().statusCode(200)
+            .body("value[0].properties.targetResource.resourceType", equalTo("Microsoft.Resources/deployments"));
+        given().when().get(SUB_DEPLOYMENTS + API).then().statusCode(200)
+            .body("value.name", not(hasItem("tenant1")));
+        given().when().head(TENANT_DEPLOYMENTS + "/tenant1" + API).then().statusCode(204);
+    }
+
+    @Test
+    void aTenantDeploymentNeedsALocationAndRefusesWhatATenantCannotHold() {
+        json(tenantDeployment().replace("{\"location\": \"westeurope\", ", "{"))
+            .when().post(TENANT_DEPLOYMENTS + "/t-noloc/validate" + API).then().statusCode(400)
+            .body("error.code", equalTo("LocationRequired"))
+            .body("error.message", containsString("tenant-scope deployment"));
+        for (String template : List.of(
+                "{\"resources\": [{\"type\": \"Microsoft.Resources/deployments\", \"apiVersion\": \"2025-04-01\","
+                    + " \"name\": \"[subscription().subscriptionId]\", \"location\": \"westeurope\","
+                    + " \"properties\": {\"mode\": \"Incremental\", \"template\": {}}}]}",
+                "{\"resources\": [{\"type\": \"Microsoft.Storage/storageAccounts\", \"apiVersion\": \"2023-01-01\","
+                    + " \"name\": \"sa\", \"location\": \"westeurope\"}]}",
+                "{\"resources\": [{\"type\": \"Microsoft.Resources/resourceGroups\", \"apiVersion\": \"2021-04-01\","
+                    + " \"name\": \"rg\", \"location\": \"westeurope\"}]}",
+                "{\"resources\": [{\"type\": \"Microsoft.Resources/deployments\", \"apiVersion\": \"2025-04-01\","
+                    + " \"name\": \"n\", \"resourceGroup\": \"rg\", \"properties\": {\"mode\": \"Incremental\","
+                    + " \"template\": {}}}]}",
+                "{\"resources\": [{\"type\": \"Microsoft.Resources/deployments\", \"apiVersion\": \"2025-04-01\","
+                    + " \"name\": \"n\", \"scope\": \"/providers/Microsoft.Management/managementGroups/mg\","
+                    + " \"location\": \"westeurope\", \"properties\": {\"mode\": \"Incremental\", \"template\": {}}}]}")) {
+            json("{\"location\": \"westeurope\", \"properties\": {\"mode\": \"Incremental\", \"template\": "
+                    + template + "}}")
+                .when().post(TENANT_DEPLOYMENTS + "/t-bad/validate" + API).then().statusCode(400)
+                .body("error.code", equalTo("InvalidTemplate"));
+        }
+    }
+
+    @Test
+    void resourceIdWithoutAGroupTakesTheSubscriptionLevelAtSubscriptionScope() throws Exception {
+        String body = "{\"location\": \"westeurope\", \"properties\": {\"mode\": \"Incremental\", \"template\": "
+            + "{\"resources\": [], \"outputs\": {\"id\": {\"type\": \"string\", "
+            + "\"value\": \"[resourceId('Microsoft.Authorization/policyDefinitions', 'p')]\"}}}}}";
+        assertEquals("Succeeded", awaitTerminal(json(body).when().put(SUB_DEPLOYMENTS + "/rid" + API)));
+        given().when().get(SUB_DEPLOYMENTS + "/rid" + API).then().statusCode(200)
+            .body("properties.outputs.id.value",
+                equalTo("/subscriptions/" + SUB + "/providers/Microsoft.Authorization/policyDefinitions/p"));
+    }
+
     @Test
     void aMissingResourceGroupIsResourceGroupNotFound() {
         json(DEPLOYMENT).when()
@@ -451,5 +786,80 @@ class DeploymentsHandlerTest {
             .body("properties.scope", equalTo(ACCOUNT));
         given().when().get(RG + "/providers/Microsoft.Authorization/policyAssignments/onAccount?api-version=2025-03-01")
             .then().statusCode(404);
+    }
+
+    @Test
+    void anOuterNestedDeploymentKeepsTheParentsSecureValuesOutOfItsTemplate() throws Exception {
+        assertEquals("Succeeded", awaitTerminal(put("withsecret", """
+            {"properties": {"mode": "Incremental",
+              "parameters": {"secret": {"value": "s3cr3t-value"}, "config": {"value": {"key": "0bj-s3cr3t"}}},
+              "template": {
+                "parameters": {"secret": {"type": "securestring"}, "config": {"type": "secureObject"},
+                               "plain": {"type": "string", "defaultValue": "visible"}},
+                "resources": [{"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01",
+                  "name": "outerchild", "properties": {"mode": "Incremental", "template": {"resources": [],
+                    "outputs": {"length": {"type": "int", "value": "[length(parameters('secret'))]"}}}}}]}}}
+            """)), () -> given().when().get(DEPLOYMENTS + "/withsecret" + API).asString());
+
+        String exported = given().when().post(DEPLOYMENTS + "/outerchild/exportTemplate" + API).then()
+            .statusCode(200).body("template.parameters.plain.defaultValue", equalTo("visible"))
+            .extract().asString();
+        assertFalse(exported.contains("s3cr3t"), exported);
+        String child = given().when().get(DEPLOYMENTS + "/outerchild" + API).then().statusCode(200)
+            .body("properties.outputs.length.value", equalTo(12))
+            .extract().asString();
+        assertFalse(child.contains("s3cr3t"), child);
+    }
+
+    @Test
+    void anOuterNestedOutputReadsAResourceOnlyTheParentDeclares() throws Exception {
+        assertEquals("Succeeded", awaitTerminal(put("outerref", """
+            {"properties": {"mode": "Incremental", "template": {
+              "variables": {"account": "deploysa0001"},
+              "resources": [
+                {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                 "name": "[variables('account')]", "location": "westeurope", "kind": "StorageV2",
+                 "sku": {"name": "Standard_LRS"}},
+                {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "outerreader",
+                 "properties": {"mode": "Incremental", "template": {"resources": [], "outputs": {
+                   "blob": {"type": "string",
+                            "value": "[reference(variables('account')).primaryEndpoints.blob]"}}}}}],
+              "outputs": {"blob": {"type": "string",
+                                   "value": "[reference('outerreader').outputs.blob.value]"}}}}}
+            """)), () -> given().when().get(DEPLOYMENTS + "/outerreader" + API).asString());
+
+        String blob = given().when().get(ACCOUNT + "?api-version=2023-01-01").then().statusCode(200)
+            .extract().path("properties.primaryEndpoints.blob");
+        given().when().get(DEPLOYMENTS + "/outerref" + API).then().statusCode(200)
+            .body("properties.outputs.blob.value", equalTo(blob));
+    }
+
+    @Test
+    void anInnerGrandchildOfAnOuterChildReadsItsOwnResource() throws Exception {
+        assertEquals("Succeeded", awaitTerminal(put("grandref", """
+            {"properties": {"mode": "Incremental", "template": {
+              "resources": [
+                {"type": "Microsoft.ManagedIdentity/userAssignedIdentities", "apiVersion": "2023-01-31",
+                 "name": "deploysa0001", "location": "westeurope"},
+                {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "outerchild",
+                 "properties": {"mode": "Incremental", "template": {"resources": [
+                   {"type": "Microsoft.Resources/deployments", "apiVersion": "2022-09-01", "name": "innergrandchild",
+                    "properties": {"mode": "Incremental", "expressionEvaluationOptions": {"scope": "inner"},
+                     "template": {"resources": [
+                       {"type": "Microsoft.Storage/storageAccounts", "apiVersion": "2023-01-01",
+                        "name": "deploysa0001", "location": "westeurope", "kind": "StorageV2",
+                        "sku": {"name": "Standard_LRS"}}],
+                      "outputs": {"blob": {"type": "string",
+                                           "value": "[reference('deploysa0001').primaryEndpoints.blob]"}}}}}],
+                   "outputs": {"blob": {"type": "string",
+                                        "value": "[reference('innergrandchild').outputs.blob.value]"}}}}}],
+              "outputs": {"blob": {"type": "string",
+                                   "value": "[reference('outerchild').outputs.blob.value]"}}}}}
+            """)), () -> given().when().get(DEPLOYMENTS + "/innergrandchild" + API).asString());
+
+        String blob = given().when().get(ACCOUNT + "?api-version=2023-01-01").then().statusCode(200)
+            .extract().path("properties.primaryEndpoints.blob");
+        given().when().get(DEPLOYMENTS + "/grandref" + API).then().statusCode(200)
+            .body("properties.outputs.blob.value", equalTo(blob));
     }
 }
