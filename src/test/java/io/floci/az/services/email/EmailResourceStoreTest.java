@@ -15,8 +15,10 @@ import java.time.Instant;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.lessThan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -150,5 +152,36 @@ class EmailResourceStoreTest {
         given().contentType("application/json").body(BODY)
             .when().put("/subscriptions/sub-norg/providers/Microsoft.Communication/emailServices/norg" + API)
             .then().statusCode(404);
+    }
+
+    @Test
+    void checkNameAvailabilityRejectsANameOutsideTheCommunicationServiceNameRule() {
+        // Azure refuses the name, as the PUT here does under parity-overrides.strict-names, so it is not available.
+        given().contentType("application/json")
+            .body("{\"name\":\"has.dot\",\"type\":\"Microsoft.Communication/CommunicationServices\"}")
+            .when().post("/subscriptions/sub-invalid/providers/Microsoft.Communication/checkNameAvailability" + API)
+            .then().statusCode(200)
+            .body("nameAvailable", equalTo(false)).body("reason", equalTo("Invalid"))
+            .body("message", containsString("has.dot"));
+    }
+
+    @Test
+    void checkNameAvailabilityAnswersFromTheRegistryInEverySubscription() {
+        String request = "{\"name\":\"check-comm\",\"type\":\"Microsoft.Communication/CommunicationServices\"}";
+        String inOwner = "/subscriptions/sub-check-a/providers/Microsoft.Communication/checkNameAvailability" + API;
+        String inOther = "/subscriptions/sub-check-b/providers/microsoft.communication/checknameavailability" + API;
+        String owner = provider("sub-check-a", "rg") + "/communicationServices/check-comm";
+
+        given().contentType("application/json").body(request).when().post(inOther).then().statusCode(200)
+            .body("nameAvailable", equalTo(true)).body("reason", equalTo("NameAvailable"));
+        given().contentType("application/json").body(BODY).when().put(owner + API).then().statusCode(201);
+        for (String check : new String[] {inOwner, inOther}) {
+            given().contentType("application/json").body(request).when().post(check).then().statusCode(200)
+                .body("nameAvailable", equalTo(false)).body("reason", equalTo("AlreadyExists"))
+                .body("message", equalTo("Requested name is unavailable for the requested type"));
+        }
+        given().when().delete(owner + API).then().statusCode(lessThan(300));
+        given().contentType("application/json").body(request).when().post(inOther).then().statusCode(200)
+            .body("nameAvailable", equalTo(true));
     }
 }
